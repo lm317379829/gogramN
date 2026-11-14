@@ -93,7 +93,10 @@ type Client struct {
 	peerFetches     map[cachePeerKey]*peerLookup
 	exportedKeys    map[int]*AuthExportedAuthorization
 	exportedKeysMu  sync.Mutex
+	exportingKeys   map[int]*exportAuthPending
 	transfers       transferState
+	downloadCacheMu sync.Mutex
+	downloadSenders *downloadSenderCache
 	Log             Logger
 }
 
@@ -127,46 +130,47 @@ const (
 )
 
 type ClientConfig struct {
-	AppID            int32                // Telegram API ID from my.telegram.org
-	AppHash          string               // Telegram API Hash from my.telegram.org
-	DeviceConfig     DeviceConfig         // Device and app identification settings
-	Session          string               // Path to session file for persistent auth
-	StringSession    string               // Base64 encoded session string (alternative to file)
-	SessionName      string               // Identifier for this session (used in log prefixes)
-	SessionAESKey    string               // AES-256 key for encrypting session file
-	ParseMode        string               // Default message parse mode: "HTML" or "Markdown"
-	MemorySession    bool                 // Keep session in memory only, don't persist to disk
-	DataCenter       int                  // Initial DC to connect to (1-5, default: 4)
-	IpAddr           string               // Custom DC IP address (overrides DataCenter)
-	PublicKeys       []*rsa.PublicKey     // RSA public keys for server verification
-	NoUpdates        bool                 // Disable update handling (bot-only mode)
-	DisableCache     bool                 // Disable peer/chat caching
-	TestMode         bool                 // Connect to Telegram test servers
-	LogLevel         LogLevel             // Logging verbosity (Trace, Debug, Info, Warn, Error)
-	Logger           Logger               // Custom logger implementation
-	Proxy            Proxy                // Proxy configuration (SOCKS5, HTTP, MTProxy)
-	LocalAddr        string               // Local network interface to bind (IP:port)
-	ForceIPv6        bool                 // Prefer IPv6 connections to Telegram
-	NoPreconnect     bool                 // Delay connection until Connect() is called
-	Cache            *CACHE               // Custom cache instance
-	CacheSenders     bool                 // Cache exported senders for file operations
-	TransportMode    TransportMode        // Wire protocol framing mode; defaults to TransportModeAbridged
-	SleepThresholdMs int                  // Auto-sleep threshold for flood wait (ms)
-	AlbumWaitTime    int64                // Time to wait for grouped album messages (ms)
-	CommandPrefixes  string               // Bot command prefixes (default: "/!")
-	FloodHandler     func(err error) bool // Called on FLOOD_WAIT; return true to retry after wait
-	ErrorHandler     func(err error) bool // Called on request errors; return true to retry
-	Timeout          int                  // TCP connection timeout in seconds (default: 60)
-	ReqTimeout       int                  // RPC request timeout in seconds (default: 60)
-	Transport        TransportType        // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
-	Obfuscated       bool                 // Wrap TCP transport with mtproto obfuscation (only meaningful for TransportTCP)
-	HTTPPath         string               // Override the HTTP/HTTPS request path (defaults to "/api", or "/apiw1" on Telegram web endpoints)
-	EnablePFS        bool                 // Enable Perfect Forward Secrecy with temp auth keys
-	PFSKeyLifetime   int32                // Lifetime (seconds) for PFS temp key; 0 = 24h
-	DisableGapFetch  bool                 // Disable per-counter gap fetching; ordering still buffers gaps. Explicit/too-long/idle recovery remains enabled.
-	RawUpdates       bool                 // Enable raw update mode, bypassing pts/qts gap tracking but still dispatching updates to handlers
-	UpdateWorkers    int                  // Maximum concurrent update tasks (default: 64).
-	UpdateQueueSize  int                  // Maximum queued update tasks (default: 10000). Overflow is dropped with a warning.
+	AppID               int32                             // Telegram API ID from my.telegram.org
+	AppHash             string                            // Telegram API Hash from my.telegram.org
+	DeviceConfig        DeviceConfig                      // Device and app identification settings
+	Session             string                            // Path to session file for persistent auth
+	StringSession       string                            // Base64 encoded session string (alternative to file)
+	SessionName         string                            // Identifier for this session (used in log prefixes)
+	SessionAESKey       string                            // AES-256 key for encrypting session file
+	ParseMode           string                            // Default message parse mode: "HTML" or "Markdown"
+	MemorySession       bool                              // Keep session in memory only, don't persist to disk
+	DataCenter          int                               // Initial DC to connect to (1-5, default: 4)
+	IpAddr              string                            // Custom DC IP address (overrides DataCenter)
+	PublicKeys          []*rsa.PublicKey                  // RSA public keys for server verification
+	NoUpdates           bool                              // Disable update handling (bot-only mode)
+	DisableCache        bool                              // Disable peer/chat caching
+	TestMode            bool                              // Connect to Telegram test servers
+	LogLevel            LogLevel                          // Logging verbosity (Trace, Debug, Info, Warn, Error)
+	Logger              Logger                            // Custom logger implementation
+	Proxy               Proxy                             // Proxy configuration (SOCKS5, HTTP, MTProxy)
+	LocalAddr           string                            // Local network interface to bind (IP:port)
+	ForceIPv6           bool                              // Prefer IPv6 connections to Telegram
+	NoPreconnect        bool                              // Delay connection until Connect() is called
+	Cache               *CACHE                            // Custom cache instance
+	CacheSenders        bool                              // Cache exported senders for file operations
+	TransportMode       TransportMode                     // Wire protocol framing mode; defaults to TransportModeAbridged
+	SleepThresholdMs    int                               // Auto-sleep threshold for flood wait (ms)
+	AlbumWaitTime       int64                             // Time to wait for grouped album messages (ms)
+	CommandPrefixes     string                            // Bot command prefixes (default: "/!")
+	FloodHandler        func(err error) bool              // Called on FLOOD_WAIT; return true to retry after wait
+	FloodHandlerContext func(context.Context, error) bool // Optional cancellable callback; takes precedence.
+	ErrorHandler        func(err error) bool              // Called on request errors; return true to retry
+	Timeout             int                               // TCP connection timeout in seconds (default: 60)
+	ReqTimeout          int                               // RPC request timeout in seconds (default: 60)
+	Transport           TransportType                     // Transport variant (TCP, WebSocket, HTTP, etc.) — default TCP
+	Obfuscated          bool                              // Wrap TCP transport with mtproto obfuscation (only meaningful for TransportTCP)
+	HTTPPath            string                            // Override the HTTP/HTTPS request path (defaults to "/api", or "/apiw1" on Telegram web endpoints)
+	EnablePFS           bool                              // Enable Perfect Forward Secrecy with temp auth keys
+	PFSKeyLifetime      int32                             // Lifetime (seconds) for PFS temp key; 0 = 24h
+	DisableGapFetch     bool                              // Disable per-counter gap fetching; ordering still buffers gaps. Explicit/too-long/idle recovery remains enabled.
+	RawUpdates          bool                              // Enable raw update mode, bypassing pts/qts gap tracking but still dispatching updates to handlers
+	UpdateWorkers       int                               // Maximum concurrent update tasks (default: 64).
+	UpdateQueueSize     int                               // Maximum queued update tasks (default: 10000). Overflow is dropped with a warning.
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -239,6 +243,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 	}
 
 	client.exSenders = NewExSenders()
+	client.resetDownloadSenders()
 
 	ready = true
 	return client, nil
@@ -266,21 +271,22 @@ func (c *Client) setupMTProto(config ClientConfig) error {
 		Logger: c.Log.CloneInternal().
 			WithPrefix("gogram " +
 				lp("mtproto", config.SessionName)),
-		StringSession:  config.StringSession,
-		LocalAddr:      config.LocalAddr,
-		MemorySession:  config.MemorySession,
-		Ipv6:           config.ForceIPv6,
-		CustomHost:     customHost,
-		FloodHandler:   config.FloodHandler,
-		ErrorHandler:   config.ErrorHandler,
-		Timeout:        config.Timeout,
-		ReqTimeout:     config.ReqTimeout,
-		Transport:      config.Transport,
-		Mode:           string(config.TransportMode),
-		Obfuscated:     config.Obfuscated,
-		HTTPPath:       config.HTTPPath,
-		EnablePFS:      config.EnablePFS,
-		PFSKeyLifetime: config.PFSKeyLifetime,
+		StringSession:       config.StringSession,
+		LocalAddr:           config.LocalAddr,
+		MemorySession:       config.MemorySession,
+		Ipv6:                config.ForceIPv6,
+		CustomHost:          customHost,
+		FloodHandler:        config.FloodHandler,
+		FloodHandlerContext: config.FloodHandlerContext,
+		ErrorHandler:        config.ErrorHandler,
+		Timeout:             config.Timeout,
+		ReqTimeout:          config.ReqTimeout,
+		Transport:           config.Transport,
+		Mode:                string(config.TransportMode),
+		Obfuscated:          config.Obfuscated,
+		HTTPPath:            config.HTTPPath,
+		EnablePFS:           config.EnablePFS,
+		PFSKeyLifetime:      config.PFSKeyLifetime,
 		OnMigration: func() {
 			c.InitialRequest()
 		},
@@ -595,6 +601,7 @@ func (c *Client) resetBackground() {
 	if c.exSenders != nil {
 		c.exSenders.ensureRunning()
 	}
+	c.resetDownloadSenders()
 }
 
 // Returns true if the client is authorized as a user or a bot
@@ -703,6 +710,7 @@ func (c *Client) shutdownBackground(discardUpdates bool) {
 	if c.exSenders != nil {
 		c.exSenders.Close()
 	}
+	c.closeDownloadSenders()
 }
 
 // switchDC permanently switches the data center
@@ -961,6 +969,7 @@ func (c *Client) CreateExportedSender(ctx context.Context, dcID int, cdn bool, m
 	}
 
 	for retry := 0; retry <= retryLimit; retry++ {
+		var usedAuth *AuthExportedAuthorization
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -984,29 +993,17 @@ func (c *Client) CreateExportedSender(ctx context.Context, dcID int, cdn bool, m
 				}
 			} else {
 				c.Log.Info("exporting auth (DC%d)", dcID)
-				response, authErr := c.MakeRequest(ctx, &AuthExportAuthorizationParams{DcID: int32(exported.GetDC())})
-				err = authErr
-				if err == nil {
-					var ok bool
-					auth, ok = response.(*AuthExportedAuthorization)
-					if !ok {
-						err = fmt.Errorf("unexpected exported auth response %T", response)
-					}
-				}
+				auth, err = c.getExportedAuthorization(ctx, int32(exported.GetDC()))
 				if err != nil {
 					lastError = fmt.Errorf("exporting auth: %w", err)
-					c.Log.Error("failed to export authorization: %s", lastError.Error())
+					if ctx.Err() != nil {
+						return nil, ctx.Err()
+					}
 					continue
 				}
-
-				c.exportedKeysMu.Lock()
-				if c.exportedKeys == nil {
-					c.exportedKeys = make(map[int]*AuthExportedAuthorization)
-				}
-				c.exportedKeys[dcID] = auth
-				c.exportedKeysMu.Unlock()
 			}
 
+			usedAuth = auth
 			initialReq.Query = &AuthImportAuthorizationParams{
 				ID:    auth.ID,
 				Bytes: auth.Bytes,
@@ -1014,14 +1011,17 @@ func (c *Client) CreateExportedSender(ctx context.Context, dcID int, cdn bool, m
 		}
 
 		c.Log.Debug("initializing exported sender")
-		_, err = exported.MakeRequest(ctx, &InvokeWithLayerParams{
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err = exported.MakeRequest(reqCtx, &InvokeWithLayerParams{
 			Layer: ApiVersion,
 			Query: initialReq,
 		})
+		cancel()
 
 		if err != nil {
 			lastError = fmt.Errorf("making initial request: %w", err)
 			if c.MatchRPCError(err, "AUTH_BYTES_INVALID") {
+				c.invalidateExportedAuthorization(exported.GetDC(), usedAuth)
 				authParam.ID = 0
 				c.Log.Debug("AUTH_BYTES_INVALID: re-exporting authorization")
 				continue
@@ -1044,6 +1044,9 @@ func (c *Client) CreateExportedSender(ctx context.Context, dcID int, cdn bool, m
 		return exported, nil
 	}
 
+	if lastError == nil {
+		lastError = errors.New("exported sender initialization failed after retries")
+	}
 	return nil, lastError
 }
 
@@ -1094,6 +1097,11 @@ func (c *Client) SetParseMode(mode string) {
 // Ping telegram server TCP connection
 func (c *Client) Ping() time.Duration {
 	return c.MTProto.Ping(context.Background())
+}
+
+// PingContext probes the connection with cancellation and an explicit error.
+func (c *Client) PingContext(ctx context.Context) (time.Duration, error) {
+	return c.MTProto.PingContext(ctx)
 }
 
 // Gets the connected DC-ID

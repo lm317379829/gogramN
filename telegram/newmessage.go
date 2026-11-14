@@ -720,12 +720,7 @@ func (m *NewMessage) WaitClick(timeout ...int32) (*CallbackQuery, error) {
 
 // Client.SendMessage ReplyID set to messageID
 func (m *NewMessage) Reply(Text any, Opts ...*SendOptions) (*NewMessage, error) {
-	if len(Opts) == 0 {
-		Opts = append(Opts, &SendOptions{ReplyID: m.ID})
-	} else {
-		Opts[0].ReplyID = m.ID
-	}
-	resp, err := m.Client.SendMessage(m.ChannelID(), Text, Opts[0])
+	resp, err := m.Client.SendMessage(m.ChannelID(), Text, replyOptions(m.ID, Opts))
 	if resp == nil || resp.Message == nil {
 		return nil, err
 	}

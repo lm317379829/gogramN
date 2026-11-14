@@ -173,6 +173,7 @@ type MTProto struct {
 	rpcResponseHandlers   []func(i any)
 	handlersMu            sync.RWMutex
 	floodHandler          func(err error) bool
+	floodHandlerContext   func(context.Context, error) bool
 	errorHandler          func(err error) bool
 	connectionHandler     func(err error) error
 	exported              bool
@@ -206,9 +207,10 @@ type Config struct {
 	AppID          int32                 // Telegram API ID
 	EnablePFS      bool                  // Enable Perfect Forward Secrecy
 
-	FloodHandler      func(err error) bool  // Called on FLOOD_WAIT; return true to retry
-	ErrorHandler      func(err error) bool  // Called on errors; return true to retry
-	ConnectionHandler func(err error) error // Custom reconnection handler
+	FloodHandlerContext func(context.Context, error) bool // Optional cancellable handler; takes precedence over FloodHandler.
+	FloodHandler        func(err error) bool              // Called on FLOOD_WAIT; return true to retry
+	ErrorHandler        func(err error) bool              // Called on errors; return true to retry
+	ConnectionHandler   func(err error) error             // Custom reconnection handler
 
 	ServerHost     string         // Telegram server address (IP:port)
 	PublicKey      *rsa.PublicKey // RSA public key for server verification
@@ -296,6 +298,7 @@ func NewMTProto(c Config) (*MTProto, error) {
 		proxy:                 c.Proxy,
 		localAddr:             c.LocalAddr,
 		floodHandler:          func(err error) bool { return false },
+		floodHandlerContext:   c.FloodHandlerContext,
 		errorHandler:          func(err error) bool { return false },
 		reqTimeout:            utils.MinSafeDuration(c.ReqTimeout),
 		mode:                  parseTransportMode(c.Mode),
@@ -1271,11 +1274,14 @@ func (m *MTProto) makeRequest(ctx context.Context, data tl.Object, maxAttempts i
 				return nil, rpcError
 			}
 			if strings.Contains(rpcError.Message, "FLOOD_WAIT_") || strings.Contains(rpcError.Message, "FLOOD_PREMIUM_WAIT_") {
-				if maxAttempts > 1 && m.floodHandler != nil && m.floodHandler(rpcError) {
+				if maxAttempts > 1 && m.handleFloodWait(ctx, rpcError) {
 					lastErr = rpcError
 					attempt++
 					packet = requestPacket{}
 					continue
+				}
+				if err := ctx.Err(); err != nil {
+					return nil, err
 				}
 				return nil, rpcError
 			}

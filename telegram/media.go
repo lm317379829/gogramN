@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2025 @AmarnathCJD
+// Copyright (c) 2025 @AmarnathCJD
 
 package telegram
 
@@ -60,7 +60,8 @@ type WorkerPool struct {
 	fillDone     chan struct{}
 	requestLimit int
 	// owned is set only for private transfer connections, never cached senders.
-	owned bool
+	owned   bool
+	release func() // Releases a shared download sender; called once by Close.
 }
 
 func NewWorkerPool(size int) *WorkerPool {
@@ -169,6 +170,10 @@ func (wp *WorkerPool) Close() {
 		if cancel != nil {
 			cancel()
 			<-done
+		}
+		if wp.release != nil {
+			wp.release()
+			return
 		}
 		if wp.owned {
 			for _, sender := range workers {
@@ -1124,6 +1129,10 @@ func chunkSizeCalc(size int64) int {
 }
 
 type DownloadOptions struct {
+	// WorkerPool is caller-owned and used only by DownloadChunkContext.
+	WorkerPool *WorkerPool
+	// RequestTimeout overrides the per-RPC timeout; zero preserves adaptive defaults.
+	RequestTimeout   time.Duration
 	NoMediaDC        bool
 	FileName         string              // Path to save the downloaded file
 	Threads          int                 // Number of concurrent download workers
@@ -1756,6 +1765,9 @@ func (j *downloadJob) fetchWithRetry(ctx context.Context, part downloadRange, fe
 }
 
 func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part downloadRange, attempt int) (downloadResult, error) {
+	if err := ctx.Err(); err != nil {
+		return downloadResult{}, err
+	}
 	j.cdnMu.Lock()
 	cdn := j.cdn
 	j.cdnMu.Unlock()
@@ -1779,12 +1791,28 @@ func (j *downloadJob) fetchPart(ctx context.Context, pool *WorkerPool, part down
 		return downloadResult{}, contextErr(reqCtx, errors.New("failed to acquire download worker"))
 	}
 	defer pool.FreeWorker(sender)
+	if j.opts.WorkerPool == pool && !sender.IsTcpActive() {
+		if err := ctx.Err(); err != nil {
+			return downloadResult{}, err
+		}
+		return downloadResult{}, ErrWorkerTCPDead
+	}
 
 	request := j.makeGetFileRequest(part)
 	if err := j.throttle.wait(ctx, part.limit); err != nil {
 		return downloadResult{}, err
 	}
 	response, err := j.client.transferRequest(ctx, sender.MTProto, false, part.limit, j.requestTimeout(part.limit, attempt), request)
+	if err != nil && j.opts.WorkerPool == pool {
+		if ctx.Err() != nil {
+			return downloadResult{}, ctx.Err()
+		}
+		msg := strings.ToLower(err.Error())
+		if !sender.IsTcpActive() || strings.Contains(msg, "connection reset") || strings.Contains(msg, "broken pipe") || strings.Contains(msg, "eof") {
+			return downloadResult{}, fmt.Errorf("%w: %v", ErrWorkerTCPDead, err)
+		}
+	}
+
 	if j.opts.Delay > 0 {
 		if sleepErr := sleepContext(ctx, time.Duration(j.opts.Delay)*time.Millisecond); sleepErr != nil && err == nil {
 			if file, ok := response.(*UploadFileObj); ok {
@@ -2017,6 +2045,9 @@ func (j *downloadJob) classifyError(ctx context.Context, err error) downloadFail
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return downloadFailure{kind: downloadErrContext, err: ctxErr}
 	}
+	if errors.Is(err, ErrWorkerTCPDead) {
+		return downloadFailure{kind: downloadErrFatal, err: err}
+	}
 	if errors.Is(err, errCDNIntegrity) || errors.Is(err, errDownloadResponse) || errors.Is(err, errDownloadAttempts) {
 		return downloadFailure{kind: downloadErrFatal, err: err}
 	}
@@ -2070,6 +2101,9 @@ func (j *downloadJob) sleepRetry(ctx context.Context, failure downloadFailure, a
 }
 
 func (j *downloadJob) requestTimeout(limit int, attempt int) time.Duration {
+	if j.opts != nil && j.opts.RequestTimeout > 0 {
+		return j.opts.RequestTimeout
+	}
 	base := 45 * time.Second
 	switch {
 	case limit >= 1024*1024:
@@ -2304,13 +2338,16 @@ func (c *Client) DownloadChunkContext(ctx context.Context, media any, start, end
 	defer job.log.Flush()
 	defer job.closeDCPools()
 
-	pool := NewWorkerPool(1)
-	defer pool.Close()
-	if err := initializeTransferWorkers(1, dc, c, pool, !opts.NoMediaDC, true, ctx); err != nil {
-		return nil, "", err
-	}
-	if !pool.WaitReady(job.ctx) {
-		return nil, "", errors.New("failed to initialize worker")
+	pool := opts.WorkerPool
+	if pool == nil {
+		pool = NewWorkerPool(1)
+		defer pool.Close()
+		if err := initializeTransferWorkers(1, dc, c, pool, !opts.NoMediaDC, true, ctx); err != nil {
+			return nil, "", err
+		}
+		if !pool.WaitReady(ctx) {
+			return nil, "", contextErr(ctx, errors.New("failed to initialize worker"))
+		}
 	}
 
 	var buf []byte

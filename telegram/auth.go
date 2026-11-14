@@ -728,6 +728,7 @@ func (c *Client) Edit2FA(currPwd, newPwd string, opts ...*PasswordOptions) (bool
 }
 
 type QrToken struct {
+	authorized       bool
 	qrBase64         string
 	qrSmall          string
 	passwordCallback AuthCallback
@@ -837,25 +838,14 @@ func (q *QrToken) Renew() error {
 		return err
 	}
 
-	q.token = qrNew.token
-	q.url = qrNew.url
-	q.expiresIn = qrNew.expiresIn
-	q.timeout = qrNew.timeout
-	q.maxRetries = qrNew.maxRetries
-	q.passwordCallback = qrNew.passwordCallback
-	q.onWrongPassword = qrNew.onWrongPassword
-
-	qrMake, err := utils.NewQRCode(q.url)
-	if err != nil {
-		return err
-	}
-
-	q.qrBase64 = qrMake.Base64PNG(0)
-	q.qrSmall = qrMake.ToSmallString(false)
+	q.adoptRenewedToken(qrNew)
 	return nil
 }
 
 func (q *QrToken) WaitLogin(timeout ...int32) error {
+	if q.authorized {
+		return nil
+	}
 	if au, err := q.client.IsAuthorized(); au || err == nil {
 		return nil
 	}
@@ -883,30 +873,23 @@ func (q *QrToken) WaitLogin(timeout ...int32) error {
 				return err
 			}
 		}
-	QrResponseSwitch:
-		switch req := resp.(type) {
-		case *AuthLoginTokenMigrateTo:
-			q.client.SwitchDc(int(req.DcID))
-			resp, err = q.client.AuthImportLoginToken(req.Token)
-			if err != nil {
-				return err
-			}
-			goto QrResponseSwitch
-		case *AuthLoginTokenSuccess:
-			q.client.Log.Info("QR login successful")
-			switch u := req.Authorization.(type) {
-			case *AuthAuthorizationObj:
-				switch u := u.User.(type) {
-				case *UserObj:
-					q.client.Cache.UpdateUser(u)
-				case *UserEmpty:
-					return fmt.Errorf("empty user received after qr login")
-				default:
-					return fmt.Errorf("unexpected user type received after qr login: %T", u)
+		for count := 0; count < 5; count++ {
+			if migration, ok := resp.(*AuthLoginTokenMigrateTo); ok {
+				if migration == nil {
+					return fmt.Errorf("nil QR DC migration")
 				}
+				if err := q.client.SwitchDc(int(migration.DcID)); err != nil {
+					return err
+				}
+				resp, err = importQRTokenWithPassword(migration.Token, q.client.AuthImportLoginToken, q.handleQrPasswordAuth)
+				if err != nil {
+					return err
+				}
+				continue
 			}
+			return q.finishQRLogin(resp)
 		}
-		return nil
+		return fmt.Errorf("too many QR DC migrations")
 	case <-time.After(time.Duration(q.timeout) * time.Second):
 		return fmt.Errorf("qr login wait timeout after %d seconds", q.timeout)
 	}
@@ -934,6 +917,12 @@ func (c *Client) QRLogin(options ...QrOptions) (*QrToken, error) {
 	}
 
 	switch qr := qr.(type) {
+	case *AuthLoginTokenSuccess:
+		q := &QrToken{client: c}
+		if err := q.finishQRLogin(qr); err != nil {
+			return nil, err
+		}
+		return q, nil
 	case *AuthLoginTokenMigrateTo:
 		if err := c.SwitchDc(int(qr.DcID)); err != nil {
 			return nil, err
@@ -948,9 +937,7 @@ func (c *Client) QRLogin(options ...QrOptions) (*QrToken, error) {
 			return nil, err
 		}
 
-		return &QrToken{
-			qrBase64:         qrCodeMaker.Base64PNG(0),
-			qrSmall:          qrCodeMaker.ToSmallString(true),
+		q := &QrToken{
 			passwordCallback: opts.PasswordCallback,
 			onWrongPassword:  opts.OnWrongPassword,
 			maxRetries:       opts.MaxRetries,
@@ -960,7 +947,9 @@ func (c *Client) QRLogin(options ...QrOptions) (*QrToken, error) {
 			client:           c,
 			ignoredIDs:       opts.IgnoredIDs,
 			timeout:          opts.Timeout,
-		}, nil
+		}
+		q.setQRCode(qrCodeMaker)
+		return q, nil
 	}
 
 	return nil, fmt.Errorf("unexpected qr login response type: %T", qr)
