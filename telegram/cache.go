@@ -4,6 +4,7 @@ package telegram
 
 import (
 	"container/list"
+	"context"
 	"encoding/gob"
 	"encoding/json"
 	"errors"
@@ -689,242 +690,33 @@ func (c *CACHE) LookupUsername(username string) (peerID int64, accessHash int64,
 }
 
 func (c *Client) GetInputPeer(peerID int64) (InputPeer, error) {
-	if peerID == 0 {
-		return nil, errors.New("invalid peer ID 0: use GetMe to retrieve self or pass 'me'")
-	}
-	if peerID < -1000000000000 {
-		channelID := trimSuffixHundred(peerID)
-		c.Cache.Lock()
-		if channelHash, ok := c.Cache.InputPeers.InputChannels[channelID]; ok {
-			c.Cache.touchChannelLRU(channelID)
-			c.Cache.Unlock()
-			return &InputPeerChannel{channelID, channelHash}, nil
-		}
-		c.Cache.Unlock()
-
-		// try to fetch from Telegram
-		if channel, err := c.getChannelFromCache(channelID); err == nil {
-			return &InputPeerChannel{channelID, channel.AccessHash}, nil
-		}
-
-		return nil, fmt.Errorf("there is no channel with id '%d' or missing from cache", peerID)
-	}
-
-	// chat id (negative)
-	if peerID < 0 {
-		chatID := peerID * -1
-		c.Cache.Lock()
-		_, chatExists := c.Cache.chats[chatID]
-		if chatExists {
-			c.Cache.touchLRU(cachePeerKey{'g', chatID})
-		}
-		c.Cache.Unlock()
-
-		if chatExists {
-			return &InputPeerChat{chatID}, nil
-		}
-
-		// try to fetch from Telegram
-		if _, err := c.getChatFromCache(chatID); err == nil {
-			return &InputPeerChat{chatID}, nil
-		}
-
-		return nil, fmt.Errorf("there is no chat with id '%d' or missing from cache", peerID)
-	}
-
-	// user id (positive)
-	c.Cache.Lock()
-	userHash, userExists := c.Cache.InputPeers.InputUsers[peerID]
-	if userExists {
-		c.Cache.touchUserLRU(peerID)
-	}
-	c.Cache.Unlock()
-
-	if userExists {
-		return &InputPeerUser{peerID, userHash}, nil
-	}
-
-	// check if it's a channel without -100 prefix before hitting the network
-	c.Cache.Lock()
-	channelHash, channelExists := c.Cache.InputPeers.InputChannels[peerID]
-	if channelExists {
-		c.Cache.touchChannelLRU(peerID)
-	}
-	c.Cache.Unlock()
-
-	if channelExists {
-		return &InputPeerChannel{peerID, channelHash}, nil
-	}
-
-	user, err := c.getUserFromCache(peerID)
-	if err == nil {
-		return &InputPeerUser{peerID, user.AccessHash}, nil
-	}
-
-	return nil, fmt.Errorf("resolving peer '%d': %w", peerID, err)
+	return c.GetInputPeerContext(context.Background(), peerID)
 }
 
 // ------------------ Get Chat/Channel/User From Cache/Telegram ------------------
 
 func (c *Client) getUserFromCache(userID int64) (*UserObj, error) {
-	value, err := c.fetchPeerOnce(cachePeerKey{'u', userID}, func() (any, error) { return c.fetchUser(userID) })
-	if err != nil {
-		return nil, err
-	}
-	return value.(*UserObj), nil
+	return c.GetUserContext(context.Background(), userID)
 }
 
 func (c *Client) fetchUser(userID int64) (*UserObj, error) {
-	c.Cache.Lock()
-	if user, found := c.Cache.users[userID]; found {
-		c.Cache.touchUserLRU(userID)
-		c.Cache.Unlock()
-		return user, nil
-	}
-	c.Cache.Unlock()
-
-	userPeer, err := c.Cache.getUserPeer(userID)
-
-	// if user is not in cache and if the bot is participant in the user, try with access hash = 0
-	var inputPeerUser InputUser = &InputUserObj{UserID: userID, AccessHash: 0}
-	if err == nil {
-		inputPeerUser = userPeer
-	}
-
-	users, err := c.UsersGetUsers([]InputUser{inputPeerUser})
-	if err != nil {
-		// If fetch with cached access hash failed, retry with access hash = 0
-		if inputPeerUser.(*InputUserObj).AccessHash != 0 {
-			c.Cache.logger.WithFields(map[string]any{
-				"user_id": userID,
-				"error":   err.Error(),
-			}).Debug("retrying user fetch with access_hash=0")
-			users, err = c.UsersGetUsers([]InputUser{&InputUserObj{UserID: userID, AccessHash: 0}})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-
-	if len(users) == 0 {
-		return nil, fmt.Errorf("no user with id '%d'", userID)
-	}
-
-	switch u := users[0].(type) {
-	case *UserObj:
-		c.Cache.UpdateUser(u)
-		return u, nil
-	case *UserEmpty:
-		return nil, fmt.Errorf("user '%d' is unknown to this account; a valid access_hash is required to resolve them", userID)
-	default:
-		return nil, fmt.Errorf("expected UserObj for id '%d', but got %T", userID, users[0])
-	}
+	return c.peerResolver(context.Background(), nil).fetchUser(userID)
 }
 
 func (c *Client) getChannelFromCache(channelID int64) (*Channel, error) {
-	channelID = trimSuffixHundred(channelID)
-	value, err := c.fetchPeerOnce(cachePeerKey{'c', channelID}, func() (any, error) { return c.fetchChannel(channelID) })
-	if err != nil {
-		return nil, err
-	}
-	return value.(*Channel), nil
+	return c.GetChannelContext(context.Background(), channelID)
 }
 
 func (c *Client) fetchChannel(channelID int64) (*Channel, error) {
-	c.Cache.Lock()
-	if channel, found := c.Cache.channels[channelID]; found {
-		c.Cache.touchChannelLRU(channelID)
-		c.Cache.Unlock()
-		return channel, nil
-	}
-	c.Cache.Unlock()
-
-	channelPeer, err := c.Cache.getChannelPeer(channelID)
-
-	// if channel is not in cache and if the bot is participant in the channel, try with access hash = 0
-	var inputChannel InputChannel = &InputChannelObj{ChannelID: channelID, AccessHash: 0}
-	if err == nil {
-		inputChannel = channelPeer
-	}
-
-	channels, err := c.ChannelsGetChannels([]InputChannel{inputChannel})
-	if err != nil {
-		if inputChannel.(*InputChannelObj).AccessHash != 0 {
-			c.Cache.logger.WithFields(map[string]any{
-				"channel_id": channelID,
-				"error":      err.Error(),
-			}).Debug("retrying channel fetch with access_hash=0")
-			channels, err = c.ChannelsGetChannels([]InputChannel{&InputChannelObj{ChannelID: channelID, AccessHash: 0}})
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-
-	channelsObj, ok := channels.(*MessagesChatsObj)
-	if !ok {
-		return nil, fmt.Errorf("expected MessagesChatsObj for channel id '%d', but got different type", channelID)
-	}
-
-	if len(channelsObj.Chats) == 0 {
-		return nil, fmt.Errorf("no channel with id '%d'", channelID)
-	}
-
-	switch ch := channelsObj.Chats[0].(type) {
-	case *Channel:
-		c.Cache.UpdateChannel(ch)
-		return ch, nil
-	case *ChannelForbidden:
-		return nil, fmt.Errorf("channel '%d' is forbidden (access denied)", channelID)
-	case *ChatEmpty:
-		return nil, fmt.Errorf("channel '%d' is unknown to this account; a valid access_hash is required", channelID)
-	default:
-		return nil, fmt.Errorf("expected Channel for id '%d', but got %T", channelID, channelsObj.Chats[0])
-	}
+	return c.peerResolver(context.Background(), nil).fetchChannel(channelID)
 }
 
 func (c *Client) getChatFromCache(chatID int64) (*ChatObj, error) {
-	value, err := c.fetchPeerOnce(cachePeerKey{'g', chatID}, func() (any, error) { return c.fetchChat(chatID) })
-	if err != nil {
-		return nil, err
-	}
-	return value.(*ChatObj), nil
+	return c.GetChatContext(context.Background(), chatID)
 }
 
 func (c *Client) fetchChat(chatID int64) (*ChatObj, error) {
-	c.Cache.Lock()
-	if chat, found := c.Cache.chats[chatID]; found {
-		c.Cache.touchLRU(cachePeerKey{'g', chatID})
-		c.Cache.Unlock()
-		return chat, nil
-	}
-	c.Cache.Unlock()
-
-	chat, err := c.MessagesGetChats([]int64{chatID})
-	if err != nil {
-		return nil, err
-	}
-
-	chatsObj, ok := chat.(*MessagesChatsObj)
-	if !ok {
-		return nil, fmt.Errorf("expected MessagesChatsObj for chat id %d, but got different type", chatID)
-	}
-
-	if len(chatsObj.Chats) == 0 {
-		return nil, fmt.Errorf("no chat with id '%d'", chatID)
-	}
-
-	chatObj, ok := chatsObj.Chats[0].(*ChatObj)
-	if !ok {
-		return nil, fmt.Errorf("expected ChatObj for id '%d', but got different type", chatID)
-	}
-	c.Cache.UpdateChat(chatObj)
-
-	return chatObj, nil
+	return c.peerResolver(context.Background(), nil).fetchChat(chatID)
 }
 
 // ----------------- Get User/Channel/Chat from cache -----------------
@@ -1463,48 +1255,70 @@ type peerLookup struct {
 }
 
 func (c *Client) fetchPeerOnce(key cachePeerKey, fetch func() (any, error)) (any, error) {
-	c.Cache.Lock()
-	var cached any
-	switch key.kind {
-	case 'u':
-		if value := c.Cache.users[key.id]; value != nil {
-			cached = value
-		}
-	case 'c':
-		if value := c.Cache.channels[key.id]; value != nil {
-			cached = value
-		}
-	case 'g':
-		if value := c.Cache.chats[key.id]; value != nil {
-			cached = value
-		}
-	}
-	if cached != nil {
-		c.Cache.touchLRU(key)
-	}
-	c.Cache.Unlock()
-	if cached != nil {
-		return cached, nil
-	}
+	return c.fetchPeerOnceContext(context.Background(), key, func(context.Context) (any, error) { return fetch() })
+}
 
-	c.peerFetchMu.Lock()
-	if call := c.peerFetches[key]; call != nil {
+func (c *Client) fetchPeerOnceContext(ctx context.Context, key cachePeerKey, fetch func(context.Context) (any, error)) (any, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.Cache.Lock()
+		var cached any
+		switch key.kind {
+		case 'u':
+			if v := c.Cache.users[key.id]; v != nil {
+				cached = v
+			}
+		case 'c':
+			if v := c.Cache.channels[key.id]; v != nil {
+				cached = v
+			}
+		case 'g':
+			if v := c.Cache.chats[key.id]; v != nil {
+				cached = v
+			}
+		}
+		if cached != nil {
+			c.Cache.touchLRU(key)
+		}
+		c.Cache.Unlock()
+		if cached != nil {
+			return cached, nil
+		}
+		c.peerFetchMu.Lock()
+		if call := c.peerFetches[key]; call != nil {
+			c.peerFetchMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-call.done:
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+				if errors.Is(call.err, context.Canceled) || errors.Is(call.err, context.DeadlineExceeded) {
+					continue
+				}
+				return call.value, call.err
+			}
+		}
+		if c.peerFetches == nil {
+			c.peerFetches = make(map[cachePeerKey]*peerLookup)
+		}
+		call := &peerLookup{done: make(chan struct{}), err: errors.New("peer lookup interrupted")}
+		c.peerFetches[key] = call
 		c.peerFetchMu.Unlock()
-		<-call.done
+		func() {
+			defer func() { c.peerFetchMu.Lock(); delete(c.peerFetches, key); close(call.done); c.peerFetchMu.Unlock() }()
+			call.value, call.err = fetch(ctx)
+			if ctx.Err() != nil {
+				call.value = nil
+				call.err = ctx.Err()
+			}
+		}()
 		return call.value, call.err
 	}
-	if c.peerFetches == nil {
-		c.peerFetches = make(map[cachePeerKey]*peerLookup)
-	}
-	call := &peerLookup{done: make(chan struct{}), err: errors.New("peer lookup interrupted")}
-	c.peerFetches[key] = call
-	c.peerFetchMu.Unlock()
-	defer func() {
-		c.peerFetchMu.Lock()
-		delete(c.peerFetches, key)
-		close(call.done)
-		c.peerFetchMu.Unlock()
-	}()
-	call.value, call.err = fetch()
-	return call.value, call.err
 }

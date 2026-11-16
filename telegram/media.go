@@ -163,8 +163,15 @@ func (wp *WorkerPool) Close() {
 		workers := wp.workers
 		wp.workers = nil
 		cancel, done := wp.fillCancel, wp.fillDone
-		for len(wp.free) > 0 {
-			<-wp.free
+		// Next receives without holding wp.Mutex. A len check followed by a
+		// blocking receive can lose the last token to Next and deadlock Close.
+	drain:
+		for {
+			select {
+			case <-wp.free:
+			default:
+				break drain
+			}
 		}
 		wp.Unlock()
 		if cancel != nil {
@@ -2290,6 +2297,12 @@ func (c *Client) DownloadChunk(media any, start int, end int, chunkSize int) ([]
 }
 
 func (c *Client) DownloadChunkContext(ctx context.Context, media any, start, end, chunkSize int, Opts ...*DownloadOptions) ([]byte, string, error) {
+	return c.DownloadChunkRangeContext(ctx, media, int64(start), int64(end), chunkSize, Opts...)
+}
+
+// DownloadChunkRangeContext downloads [start, end) using 64-bit byte offsets,
+// including on 32-bit platforms. chunkSize retains the usual 4KB..1MB limits.
+func (c *Client) DownloadChunkRangeContext(ctx context.Context, media any, start, end int64, chunkSize int, Opts ...*DownloadOptions) ([]byte, string, error) {
 	ctx = rootCtx(ctx)
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
@@ -2314,8 +2327,8 @@ func (c *Client) DownloadChunkContext(ctx context.Context, media any, start, end
 	if dc == 0 {
 		dc = int32(c.GetDC())
 	}
-	if size > 0 && int64(end) > size {
-		end = int(size)
+	if size > 0 && end > size {
+		end = size
 	}
 	if end <= start {
 		return []byte{}, name, nil
@@ -2375,7 +2388,7 @@ func (c *Client) DownloadChunkContext(ctx context.Context, media any, start, end
 		}
 	}
 
-	if job.knownSize && len(buf) != end-start {
+	if job.knownSize && int64(len(buf)) != end-start {
 		return nil, name, io.ErrUnexpectedEOF
 	}
 	return buf, name, nil

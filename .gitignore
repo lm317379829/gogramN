@@ -4,3 +4,10 @@
 *.txt
 _doc/*
 *.log
+
+# Keep tests and review documents local.
+*_test.go
+*.test
+test/
+tests/
+docs/

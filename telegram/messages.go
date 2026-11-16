@@ -12,6 +12,7 @@ import (
 	"errors"
 
 	"github.com/xAmarnath/gogram"
+	"github.com/xAmarnath/gogram/internal/encoding/tl"
 )
 
 type SendOptions struct {
@@ -1502,15 +1503,46 @@ type IterProgressInfo struct {
 type IterErrorCallback func(err error, progress *IterProgressInfo) bool
 
 func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, error) {
-	opt := getVariadic(Opts, &SearchOption{
+	return c.getMessages(PeerID, func(ctx context.Context, req tl.Object) (any, error) {
+		if _, ok := req.(*UsersGetUsersParams); ok {
+			return c.MakeRequest(ctx, req, reflect.TypeOf([]User(nil)))
+		}
+		return c.MakeRequest(ctx, req)
+	}, Opts...)
+}
+
+func (c *Client) getMessages(PeerID any, fetch func(context.Context, tl.Object) (any, error), Opts ...*SearchOption) ([]NewMessage, error) {
+	opt := *getVariadic(Opts, &SearchOption{
 		Filter:           &InputMessagesFilterEmpty{},
 		SleepThresholdMs: 20,
 	})
-	peer, err := c.ResolvePeer(PeerID)
+	ctx := opt.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	resolver := c.peerResolver(ctx, fetch)
+	peer, err := resolver.resolvePeer(PeerID)
 	if err != nil {
 		return nil, err
 	}
 
+	request := func(req tl.Object) (MessagesMessages, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		response, err := fetch(ctx, req)
+		if err != nil {
+			return nil, contextErr(ctx, err)
+		}
+		result, ok := response.(MessagesMessages)
+		if !ok || isNilSource(result) {
+			return nil, fmt.Errorf("unexpected messages response: %T", response)
+		}
+		return result, nil
+	}
 	var (
 		messages []NewMessage
 		inputIDs []InputMessage
@@ -1554,9 +1586,9 @@ func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, e
 		for _, ids := range chunkedIds {
 			switch peer := peer.(type) {
 			case *InputPeerChannel:
-				result, err = c.ChannelsGetMessages(&InputChannelObj{ChannelID: peer.ChannelID, AccessHash: peer.AccessHash}, ids)
+				result, err = request(&ChannelsGetMessagesParams{Channel: &InputChannelObj{ChannelID: peer.ChannelID, AccessHash: peer.AccessHash}, ID: ids})
 			case *InputPeerChat, *InputPeerUser, *InputPeerSelf:
-				result, err = c.MessagesGetMessages(ids)
+				result, err = request(&MessagesGetMessagesParams{ID: ids})
 			default:
 				return nil, errors.New("invalid peer type to get messages")
 			}
@@ -1567,18 +1599,32 @@ func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, e
 			case *MessagesChannelMessages:
 				c.Cache.UpdatePeersToCache(result.Users, result.Chats)
 				for _, msg := range result.Messages {
-					messages = append(messages, *packMessage(c, msg))
+					packed, err := resolver.packMessages([]Message{msg})
+					if err != nil {
+						return messages, err
+					}
+					if len(packed) > 0 {
+						messages = append(messages, *packed[0])
+					}
 				}
 			case *MessagesMessagesObj:
 				c.Cache.UpdatePeersToCache(result.Users, result.Chats)
 				for _, msg := range result.Messages {
-					messages = append(messages, *packMessage(c, msg))
+					packed, err := resolver.packMessages([]Message{msg})
+					if err != nil {
+						return messages, err
+					}
+					if len(packed) > 0 {
+						messages = append(messages, *packed[0])
+					}
 				}
 			}
 			if len(messages) >= int(opt.Limit) && opt.Limit != 0 {
 				return messages[:opt.Limit], nil
 			}
-			time.Sleep(time.Duration(opt.SleepThresholdMs) * time.Millisecond)
+			if err := sleepContext(ctx, time.Duration(opt.SleepThresholdMs)*time.Millisecond); err != nil {
+				return messages, err
+			}
 		}
 
 		return messages, nil
@@ -1602,7 +1648,7 @@ func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, e
 		}
 
 		if opt.FromUser != nil {
-			fromUser, err := c.ResolvePeer(opt.FromUser)
+			fromUser, err := resolver.resolvePeer(opt.FromUser)
 			if err != nil {
 				return nil, err
 			}
@@ -1618,12 +1664,12 @@ func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, e
 			perReqLimit := min(int32(remaining), 100)
 			params.Limit = perReqLimit
 
-			result, err = c.MessagesSearch(params)
+			result, err = request(params)
 			if err != nil {
-				if handleIfFlood(err, c) {
+				if handleIfFlood(err, c, ctx) {
 					continue
 				}
-				return nil, err
+				return nil, contextErr(ctx, err)
 			}
 
 			var fetchedMessages []NewMessage
@@ -1631,17 +1677,35 @@ func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, e
 			case *MessagesChannelMessages:
 				c.Cache.UpdatePeersToCache(result.Users, result.Chats)
 				for _, msg := range result.Messages {
-					fetchedMessages = append(fetchedMessages, *packMessage(c, msg))
+					packed, err := resolver.packMessages([]Message{msg})
+					if err != nil {
+						return messages, err
+					}
+					if len(packed) > 0 {
+						fetchedMessages = append(fetchedMessages, *packed[0])
+					}
 				}
 			case *MessagesMessagesObj:
 				c.Cache.UpdatePeersToCache(result.Users, result.Chats)
 				for _, msg := range result.Messages {
-					fetchedMessages = append(fetchedMessages, *packMessage(c, msg))
+					packed, err := resolver.packMessages([]Message{msg})
+					if err != nil {
+						return messages, err
+					}
+					if len(packed) > 0 {
+						fetchedMessages = append(fetchedMessages, *packed[0])
+					}
 				}
 			case *MessagesMessagesSlice:
 				c.Cache.UpdatePeersToCache(result.Users, result.Chats)
 				for _, msg := range result.Messages {
-					fetchedMessages = append(fetchedMessages, *packMessage(c, msg))
+					packed, err := resolver.packMessages([]Message{msg})
+					if err != nil {
+						return messages, err
+					}
+					if len(packed) > 0 {
+						fetchedMessages = append(fetchedMessages, *packed[0])
+					}
 				}
 			}
 
@@ -1661,7 +1725,9 @@ func (c *Client) GetMessages(PeerID any, Opts ...*SearchOption) ([]NewMessage, e
 				params.MaxDate = fetchedMessages[lastIdx].Date()
 			}
 
-			time.Sleep(time.Duration(opt.SleepThresholdMs) * time.Millisecond)
+			if err := sleepContext(ctx, time.Duration(opt.SleepThresholdMs)*time.Millisecond); err != nil {
+				return messages, err
+			}
 		}
 	}
 
@@ -2170,34 +2236,41 @@ func (c *Client) InlineQuery(peerID any, Options ...*InlineOptions) (*MessagesBo
 //	  - PeerID: The ID of the chat or channel.
 //	  - MsgID: The ID of the message.
 func (c *Client) GetMediaGroup(PeerID any, MsgID int32) ([]NewMessage, error) {
-	_, err := c.ResolvePeer(PeerID)
-	if err != nil {
+	return c.GetMediaGroupContext(context.Background(), PeerID, MsgID)
+}
+
+func (c *Client) GetMediaGroupContext(ctx context.Context, PeerID any, MsgID int32) ([]NewMessage, error) {
+	return c.getMediaGroup(ctx, PeerID, MsgID, func(ctx context.Context, peer any, ids []int32) ([]NewMessage, error) {
+		return c.GetMessages(peer, &SearchOption{IDs: ids, Context: ctx})
+	})
+}
+
+func (c *Client) getMediaGroup(ctx context.Context, PeerID any, MsgID int32, fetch func(context.Context, any, []int32) ([]NewMessage, error)) ([]NewMessage, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	if MsgID <= 0 {
 		return nil, errors.New("invalid message ID")
 	}
 	fetchIDs := func(id int32) []int32 {
-		pref := id - 9
-		later := id + 10
+		pref := max(int64(1), int64(id)-9)
+		later := min(int64(2147483647), int64(id)+9)
 		var ids []int32
-		for i := pref; i < later; i++ {
-			ids = append(ids, i)
+		for i := pref; i <= later; i++ {
+			ids = append(ids, int32(i))
 		}
 		return ids
 	}
-	resp, err := c.GetMessages(PeerID, &SearchOption{
-		IDs: fetchIDs(MsgID),
-	})
+	resp, err := fetch(ctx, PeerID, fetchIDs(MsgID))
 	if err != nil {
 		return nil, err
 	}
 	getMediaGroupID := func(ms []NewMessage) int64 {
-		if len(ms) == 19 {
-			return ms[9].Message.GroupedID
-		}
 		for _, m := range ms {
-			if m.ID == MsgID-1 {
+			if m.ID == MsgID && m.Message != nil {
 				return m.Message.GroupedID
 			}
 		}
@@ -2210,7 +2283,7 @@ func (c *Client) GetMediaGroup(PeerID any, MsgID int32) ([]NewMessage, error) {
 	sameGroup := func(m []NewMessage, groupID int64) []NewMessage {
 		var msgs []NewMessage
 		for _, msg := range m {
-			if msg.Message.GroupedID == groupID {
+			if msg.Message != nil && msg.Message.GroupedID == groupID {
 				msgs = append(msgs, msg)
 			}
 		}

@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
@@ -335,179 +336,11 @@ func (c *Client) processUpdate(upd Updates) *MessageObj {
 }
 
 func (c *Client) GetSendablePeer(PeerID any) (InputPeer, error) {
-	if v := reflect.ValueOf(PeerID); v.Kind() == reflect.Pointer && v.IsNil() {
-		return nil, fmt.Errorf("peer is a nil %T", PeerID)
-	}
-	switch p := PeerID.(type) {
-	case *PeerChat:
-		if p.ChatID == 0 {
-			return nil, fmt.Errorf("invalid chat peer: missing ID")
-		}
-	case *PeerChannel:
-		if p.ChannelID == 0 {
-			return nil, fmt.Errorf("invalid channel peer: missing ID")
-		}
-	}
-	peer, err := c.getSendablePeer(PeerID)
-	if err != nil {
-		return nil, err
-	}
-
-	switch p := peer.(type) {
-	case nil:
-		return nil, fmt.Errorf("could not resolve peer %T", PeerID)
-	case *InputPeerUser:
-		if p == nil || p.UserID == 0 {
-			return nil, fmt.Errorf("invalid user peer: missing ID")
-		}
-	case *InputPeerChat:
-		if p == nil || p.ChatID == 0 {
-			return nil, fmt.Errorf("invalid chat peer: missing ID")
-		}
-	case *InputPeerChannel:
-		if p == nil || p.ChannelID == 0 {
-			return nil, fmt.Errorf("invalid channel peer: missing ID")
-		}
-	default:
-		if v := reflect.ValueOf(peer); v.Kind() == reflect.Pointer && v.IsNil() {
-			return nil, fmt.Errorf("could not resolve peer %T", PeerID)
-		}
-	}
-	return peer, nil
+	return c.ResolvePeerContext(context.Background(), PeerID)
 }
 
 func (c *Client) getSendablePeer(PeerID any) (InputPeer, error) {
-PeerSwitch:
-	switch Peer := PeerID.(type) {
-	case nil:
-		return nil, fmt.Errorf("peer is nil, cannot send nil peer")
-	case *PeerUser:
-		if Peer == nil || Peer.UserID == 0 {
-			return nil, fmt.Errorf("invalid user peer: missing ID")
-		}
-		peerEntity, err := c.GetPeerUser(Peer.UserID)
-		if err != nil {
-			return nil, err
-		}
-		return &InputPeerUser{UserID: peerEntity.UserID, AccessHash: peerEntity.AccessHash}, nil
-	case *PeerChat:
-		return &InputPeerChat{ChatID: Peer.ChatID}, nil
-	case *PeerChannel:
-		peerEntity, err := c.GetPeerChannel(Peer.ChannelID)
-		if err != nil {
-			return nil, err
-		}
-		return &InputPeerChannel{ChannelID: peerEntity.ChannelID, AccessHash: peerEntity.AccessHash}, nil
-	case *InputPeerChat:
-		return Peer, nil
-	case *InputPeerChannel:
-		return Peer, nil
-	case *InputPeerUser:
-		if Peer == nil || Peer.UserID == 0 {
-			return nil, fmt.Errorf("invalid user peer: missing ID")
-		}
-		return Peer, nil
-	case *InputPeer:
-		if Peer == nil {
-			return nil, fmt.Errorf("peer is nil")
-		}
-		return c.GetSendablePeer(*Peer)
-	case *InputUserSelf:
-		return &InputPeerSelf{}, nil
-	case *InputPeerSelf:
-		return Peer, nil
-	case *InputPeerEmpty:
-		return Peer, nil
-	case *InputPeerUserFromMessage:
-		return Peer, nil
-	case *InputPeerChannelFromMessage:
-		return Peer, nil
-	case *InputUserObj:
-		if Peer == nil || Peer.UserID == 0 {
-			return nil, fmt.Errorf("invalid user peer: missing ID")
-		}
-		return &InputPeerUser{UserID: Peer.UserID, AccessHash: Peer.AccessHash}, nil
-	case *InputChannelObj:
-		return &InputPeerChannel{ChannelID: Peer.ChannelID, AccessHash: Peer.AccessHash}, nil
-	case *ChatObj:
-		return &InputPeerChat{ChatID: Peer.ID}, nil
-	case *Channel:
-		return &InputPeerChannel{ChannelID: Peer.ID, AccessHash: Peer.AccessHash}, nil
-	case *UserObj:
-		if Peer == nil || Peer.ID == 0 {
-			return nil, fmt.Errorf("invalid user peer: missing ID; use GetMe to check lookup errors")
-		}
-		return &InputPeerUser{UserID: Peer.ID, AccessHash: Peer.AccessHash}, nil
-	case int64, int32, int:
-		peerEntity, err := c.GetInputPeer(getAnyInt(PeerID))
-		if peerEntity == nil || err != nil {
-			return nil, err
-		}
-		return peerEntity, nil
-	case string:
-		if i, err := strconv.ParseInt(Peer, 10, 64); err == nil {
-			PeerID = i
-			goto PeerSwitch
-		}
-		if Peer == "me" || Peer == "self" {
-			return &InputPeerSelf{}, nil
-		}
-
-		if peerID, accessHash, isChannel, found := c.Cache.LookupUsername(Peer); found {
-			if accessHash == 0 {
-				c.Logger.WithFields(map[string]any{
-					"username": Peer,
-					"peer_id":  peerID,
-				}).Debug("username cache incomplete, refreshing from API")
-			} else {
-				if isChannel {
-					return &InputPeerChannel{ChannelID: peerID, AccessHash: accessHash}, nil
-				}
-				return &InputPeerUser{UserID: peerID, AccessHash: accessHash}, nil
-			}
-		}
-
-		peerEntity, err := c.ResolveUsername(Peer)
-		if err != nil {
-			return nil, err
-		}
-		switch peerEntity := peerEntity.(type) {
-		case *ChatObj:
-			return &InputPeerChat{ChatID: peerEntity.ID}, nil
-		case *Channel:
-			return &InputPeerChannel{ChannelID: peerEntity.ID, AccessHash: peerEntity.AccessHash}, nil
-		case *UserObj:
-			return &InputPeerUser{UserID: peerEntity.ID, AccessHash: peerEntity.AccessHash}, nil
-		case *ChannelForbidden:
-			return &InputPeerChannel{ChannelID: peerEntity.ID, AccessHash: peerEntity.AccessHash}, nil
-		case *ChatForbidden:
-			return &InputPeerChat{ChatID: peerEntity.ID}, nil
-		default:
-			return nil, fmt.Errorf("unknown peer type %T", peerEntity)
-		}
-	case *UserFull:
-		if peerEntity, err := c.GetPeerUser(Peer.ID); err == nil {
-			return &InputPeerUser{UserID: peerEntity.UserID, AccessHash: peerEntity.AccessHash}, nil
-		}
-		return nil, fmt.Errorf("failed to get sendable peer for UserFull, cannot find user in cache")
-	case *ChatFullObj:
-		return &InputPeerChat{ChatID: Peer.ID}, nil
-	case *ChannelFull:
-		if peerEntity, err := c.GetPeerChannel(Peer.ID); err == nil {
-			return &InputPeerChannel{ChannelID: peerEntity.ChannelID, AccessHash: peerEntity.AccessHash}, nil
-		}
-		return nil, fmt.Errorf("failed to get sendable peer for ChannelFull, cannot find channel in cache")
-	case *ChannelForbidden:
-		return &InputPeerChannel{ChannelID: Peer.ID, AccessHash: Peer.AccessHash}, nil
-	case *ChatForbidden:
-		return &InputPeerChat{ChatID: Peer.ID}, nil
-	case *InputUserFromMessage:
-		return &InputPeerUserFromMessage{Peer: Peer.Peer, MsgID: Peer.MsgID, UserID: Peer.UserID}, nil
-	case *InputChannelFromMessage:
-		return &InputPeerChannelFromMessage{Peer: Peer.Peer, MsgID: Peer.MsgID, ChannelID: Peer.ChannelID}, nil
-	default:
-		return nil, fmt.Errorf("failed to get sendable peer, unknown type %s", reflect.TypeOf(PeerID).String())
-	}
+	return c.peerResolver(context.Background(), nil).sendable(PeerID)
 }
 
 // ResolvePeer resolves a peer to a sendable peer, searches the cache if the peer is already resolved
@@ -1428,39 +1261,7 @@ func (c *Client) gatherVideoThumb(path string, duration int64) (InputFile, error
 
 // ResolveUsername resolves a username to a user or chat Peer
 func (c *Client) ResolveUsername(username string, ref ...string) (any, error) {
-	username = strings.TrimPrefix(strings.TrimSpace(username), "@")
-	var referer = getVariadic(ref, "")
-
-	resp, err := c.ContactsResolveUsername(username, referer)
-	if err != nil {
-		return nil, fmt.Errorf("resolving username: %w", err)
-	}
-	c.Cache.UpdatePeersToCache(resp.Users, resp.Chats)
-	if len(resp.Users) != 0 {
-		switch User := resp.Users[0].(type) {
-		case *UserObj:
-			return User, nil
-		case *UserEmpty:
-			return User, nil
-		default:
-			return nil, fmt.Errorf("got wrong response: %s", reflect.TypeOf(resp).String())
-		}
-	} else if len(resp.Chats) != 0 {
-		switch Peer := resp.Chats[0].(type) {
-		case *ChatObj:
-			return Peer, nil
-		case *Channel:
-			return Peer, nil
-		case *ChannelForbidden:
-			return Peer, nil
-		case *ChatForbidden:
-			return Peer, nil
-		default:
-			return nil, fmt.Errorf("got wrong response: %s", reflect.TypeOf(resp).String())
-		}
-	} else {
-		return nil, fmt.Errorf("no user or chat has username %s", username)
-	}
+	return c.ResolveUsernameContext(context.Background(), username, ref...)
 }
 
 func PackMessages(c *Client, messages []Message) []*NewMessage {
@@ -1476,111 +1277,7 @@ func PackMessages(c *Client, messages []Message) []*NewMessage {
 }
 
 func packMessage(c *Client, message Message) *NewMessage {
-	var (
-		m = &NewMessage{}
-	)
-	switch message := message.(type) {
-	case *MessageObj:
-		m.ID = message.ID
-		m.OriginalUpdate = message
-		m.Message = message
-		m.Client = c
-	case *MessageService:
-		m.ID = message.ID
-		m.OriginalUpdate = message
-		m.Client = c
-		m.Message = &MessageObj{
-			Out: message.Out, Mentioned: message.Mentioned, MediaUnread: message.MediaUnread, Silent: message.Silent, ID: message.ID, FromID: message.FromID, PeerID: message.PeerID, Date: message.Date, Message: "", Post: message.Post, FromScheduled: false, ReplyTo: message.ReplyTo, FwdFrom: nil, ViaBotID: 0, Legacy: false, EditHide: false, GroupedID: 0, ReplyMarkup: nil,
-		}
-		m.Action = message.Action
-	case *MessageEmpty:
-		m.ID = message.ID
-		m.OriginalUpdate = message
-		m.Client = c
-		m.Message = &MessageObj{ID: message.ID, PeerID: message.PeerID, FromID: &PeerUser{}}
-		m.Action = &MessageActionEmpty{}
-	default:
-		return nil
-	}
-
-	// Set the chat and channel information
-	m.Chat = c.getChat(m.Message.PeerID)
-	m.Channel = c.getChannel(m.Message.PeerID)
-
-	if m.Channel != nil && m.Channel.Min {
-		if cached, err := c.GetChannel(m.Channel.ID); err == nil && cached != nil && !cached.Min {
-			m.Channel = cached
-		} else if actualChannel, err := c.ChannelsGetChannels([]InputChannel{&InputChannelObj{ChannelID: m.Channel.ID, AccessHash: m.Channel.AccessHash}}); err == nil {
-			switch actualChannels := actualChannel.(type) {
-			case *MessagesChatsObj:
-				if len(actualChannels.Chats) > 0 {
-					if channelActual, ok := actualChannels.Chats[0].(*Channel); ok {
-						c.Cache.UpdateChannel(channelActual)
-						m.Channel = channelActual
-					}
-				}
-			case *MessagesChatsSlice:
-				if len(actualChannels.Chats) > 0 {
-					if channelActual, ok := actualChannels.Chats[0].(*Channel); ok {
-						c.Cache.UpdateChannel(channelActual)
-						m.Channel = channelActual
-					}
-				}
-			}
-		}
-	} else if m.Channel != nil && !m.Channel.Min {
-		c.Cache.UpdateChannel(m.Channel)
-	}
-
-	if m.Message.Out {
-		if me := c.Me(); me != nil {
-			m.Sender = me
-		} else if m.Message.FromID != nil {
-			m.Sender = c.getSender(m.Message.FromID)
-		}
-	} else if _, empty := message.(*MessageEmpty); !empty {
-		if m.Message.FromID != nil {
-			m.Sender = c.getSender(m.Message.FromID)
-			if m.Sender != nil && m.Sender.Min {
-				if actualUser, err := c.UsersGetUsers([]InputUser{&InputUserFromMessage{
-					Peer:   c.getInputPeer(m.Message.PeerID),
-					MsgID:  m.ID,
-					UserID: m.Sender.ID,
-				}}); err == nil && len(actualUser) > 0 {
-					if userActual, ok := actualUser[0].(*UserObj); ok {
-						c.Cache.UpdateUser(userActual)
-						m.Sender = userActual
-					}
-				}
-			} else if m.Sender != nil && !m.Sender.Min {
-				c.Cache.UpdateUser(m.Sender)
-			}
-		} else {
-			m.Sender = c.getSender(m.Message.PeerID)
-		}
-	}
-
-	if (m.Channel != nil && m.Sender != nil) && (m.Sender.ID == m.Channel.ID) || (m.Message.FromID != nil && c.GetPeerType(m.Message.FromID) == EntityChannel) {
-		m.SenderChat = c.getChannel(m.Message.FromID)
-	} else {
-		m.SenderChat = &Channel{}
-	}
-
-	if m.Chat == nil && m.Sender != nil {
-		m.Chat = &ChatObj{ID: m.Sender.ID, Title: m.Sender.FirstName} // private user/bot chat
-	}
-
-	m.Peer = c.getInputPeer(m.Message.PeerID)
-	if m.IsMedia() {
-		FileID := PackBotFileID(m.Media())
-		m.File = &CustomFile{
-			FileID: FileID,
-			Name:   GetFileName(m.Media()),
-			Size:   GetFileSize(m.Media()),
-			Ext:    GetFileExt(m.Media()),
-		}
-	}
-	return m
+	return c.peerResolver(context.Background(), nil).packMessage(message)
 }
 
 func packStoryToMessage(c *Client, story *StoryItemObj) *NewMessage {
